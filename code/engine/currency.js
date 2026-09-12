@@ -1,114 +1,67 @@
-/**
- * Fixed dated FX converter engine with indexed lookups and settlement date support.
- */
+function pairKey(a, b) { return `${a.toUpperCase()}|${b.toUpperCase()}`; }
+function exactKey(date, a, b) { return `${date}|${pairKey(a, b)}`; }
 
-function pairKey(fromCurrency, toCurrency) {
-    return `${fromCurrency.toUpperCase()}|${toCurrency.toUpperCase()}`;
-}
-
-function exactKey(rateDate, fromCurrency, toCurrency) {
-    return `${rateDate}|${pairKey(fromCurrency, toCurrency)}`;
-}
-
-/**
- * Pre-indexes exchange rates for O(1) instant lookup time.
- */
-export function buildFxIndex(exchangeRates) {
+export function buildFxIndex(rows) {
     const exact = new Map();
     const series = new Map();
-
-    for (const row of exchangeRates || []) {
-        const from = String(row.from_currency || '').toUpperCase();
-        const to = String(row.to_currency || '').toUpperCase();
-        // Handles both 'date' and 'rate_date' header variations
-        const date = String(row.date || row.rate_date || '');
-        const rate = Number(row.rate);
-
+    for (const r of rows || []) {
+        const from = String(r.from_currency || '').toUpperCase();
+        const to = String(r.to_currency || '').toUpperCase();
+        const date = String(r.rate_date || r.date || '');
+        const rate = Number(r.rate);
         if (!from || !to || !date || !Number.isFinite(rate) || rate <= 0) continue;
-
         exact.set(exactKey(date, from, to), rate);
-
-        const key = pairKey(from, to);
-        if (!series.has(key)) series.set(key, []);
-        series.get(key).push({ date, rate });
+        const k = pairKey(from, to);
+        if (!series.has(k)) series.set(k, []);
+        series.get(k).push({ date, rate });
     }
-
-    for (const rows of series.values()) {
-        rows.sort((a, b) => a.date.localeCompare(b.date));
-    }
-
+    for (const arr of series.values()) arr.sort((a, b) => a.date.localeCompare(b.date));
     return { exact, series };
 }
 
-function rateOnOrBefore(series, fromCurrency, toCurrency, rateDate) {
-    const rows = series.get(pairKey(fromCurrency, toCurrency));
-    if (!rows || rows.length === 0) return null;
-
+function onOrBefore(series, from, to, date) {
+    const rows = series.get(pairKey(from, to));
+    if (!rows || !rows.length) return null;
     let found = null;
-    for (const row of rows) {
-        if (row.date <= rateDate) found = row.rate;
-        else break;
-    }
+    for (const r of rows) { if (r.date <= date) found = r.rate; else break; }
     return found;
 }
 
-/**
- * Resolves conversion rate using direct, inverse, or historical fallback lookup.
- */
-export function getFxRate(fxIndex, fromCurrency, toCurrency, rateDate) {
-    const from = String(fromCurrency || '').toUpperCase();
-    const to = String(toCurrency || '').toUpperCase();
-    const date = String(rateDate || '');
+export function getFxRate(idx, from, to, date) {
+    const f = String(from || '').toUpperCase();
+    const t = String(to || '').toUpperCase();
+    const d = String(date || '');
+    if (!f || !t || !d) return null;
+    if (f === t) return 1;
 
-    if (!from || !to || !date) return null;
-    if (from === to) return 1;
-
-    // 1. Exact direct rate
-    const exact = fxIndex.exact.get(exactKey(date, from, to));
-    if (exact != null) return exact;
-
-    // 2. Exact inverse rate
-    const inverse = fxIndex.exact.get(exactKey(date, to, from));
-    if (inverse != null) return 1 / inverse;
-
-    // 3. Historical rate on or before date
-    const prior = rateOnOrBefore(fxIndex.series, from, to, date);
-    if (prior != null) return prior;
-
-    // 4. Historical inverse rate on or before date
-    const priorInverse = rateOnOrBefore(fxIndex.series, to, from, date);
-    if (priorInverse != null) return 1 / priorInverse;
-
-    console.warn(`[FX Warning] Missing exchange rate for ${from} -> ${to} on ${date}`);
+    // 1. exact direct
+    let r = idx.exact.get(exactKey(d, f, t));
+    if (r != null) return r;
+    // 2. exact inverse
+    r = idx.exact.get(exactKey(d, t, f));
+    if (r != null) return 1 / r;
+    // 3. direct on-or-before
+    r = onOrBefore(idx.series, f, t, d);
+    if (r != null) return r;
+    // 4. inverse on-or-before
+    r = onOrBefore(idx.series, t, f, d);
+    if (r != null) return 1 / r;
     return null;
 }
 
-/**
- * Converts monetary amount to target currency.
- */
-export function convertAmount(amount, fromCurrency, toCurrency, rateDate, fxIndex) {
-    const value = Number(amount);
-    if (!Number.isFinite(value)) return 0;
-
-    const rate = getFxRate(fxIndex, fromCurrency, toCurrency, rateDate);
-    if (rate == null) return value; // Fallback to raw value if unresolvable
-    return value * rate;
+export function convert(amount, from, to, date, idx) {
+    const v = Number(amount);
+    if (!Number.isFinite(v)) return 0;
+    const rate = getFxRate(idx, from, to, date);
+    if (rate == null) {
+        // Spec: do not invent a rate. Throw so the caller can flag the row.
+        throw new Error(`FX missing: ${from}->${to} on ${date}`);
+    }
+    return v * rate;
 }
 
-/**
- * Converts financial event to user's home currency prioritizing settlement_date.
- */
-export function convertEventToHome(event, homeCurrency, fxIndex) {
-    if (!event) return 0;
-    const rateDate = event.settlement_date || event.event_date;
-    return convertAmount(event.amount, event.currency, homeCurrency, rateDate, fxIndex);
-}
-
-/**
- * Rounds monetary amounts to 2 decimal places.
- */
-export function roundMoney(amount) {
-    const value = Number(amount);
-    if (!Number.isFinite(value)) return 0;
-    return Math.round(value * 100) / 100;
+export function roundMoney(v) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return 0;
+    return Math.round(n * 100) / 100;
 }
