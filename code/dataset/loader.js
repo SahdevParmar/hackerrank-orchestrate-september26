@@ -1,101 +1,194 @@
-// Reads all participant CSVs from the repo-level dataset/ directory.
-// Resolves relative to this file's location, not process.cwd(), so it works
-// from any working directory (spec §6.4: runnable from the terminal).
-import fs from 'node:fs';
-import path from 'node:path';
-import { fileURLToPath } from 'node:url';
+// code/dataset/loader.js
+import { readFileSync, existsSync } from 'node:fs';
+import { resolve } from 'node:path';
 import { parse } from 'csv-parse/sync';
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-// code/dataset/loader.js → ../../dataset
-const DATASET_DIR = path.resolve(__dirname, '..', '..', 'dataset');
+/**
+ * Load every participant CSV from <repoRoot>/dataset/.
+ * Paths are resolved relative to the repo root passed in, NOT process.cwd().
+ *
+ * Returns:
+ *   requests         Array<row>            — sorted by request_id
+ *   requestsById     Map<request_id, row>
+ *   profilesMap      Map<user_id, row>
+ *   eventsByUser     Map<user_id, Array<event>>   — sorted by settlement_date
+ *   eventById        Map<event_id, event>
+ *   optionsByRequest Map<request_id, Array<option>>
+ *   messagesByUser   Map<user_id, Array<message>>
+ *   imagesByEvent    Map<event_id, image_id>
+ *   imagesByRequest  Map<request_id, image_id>
+ *   rates            { convert(amount, from, to, date) }
+ *   meta             { ratesRaw, missingRates: [] }
+ */
+export function loadDataset(repoRoot) {
+    const dsDir = resolve(repoRoot, 'dataset');
 
-function readCsv(filename) {
-    const p = path.join(DATASET_DIR, filename);
-    if (!fs.existsSync(p)) {
-        console.warn(`[loader] missing ${filename}`);
-        return [];
-    }
-    const text = fs.readFileSync(p, 'utf-8');
-    if (!text.trim()) return [];
-    return parse(text, {
-        columns: true,
-        skip_empty_lines: true,
-        trim: true,
-        bom: true,
-        relax_column_count: true,
-        cast: (value, ctx) => {
-            const col = String(ctx.column);
-            if (value === '') return null;
-            // Keep IDs and dates as strings; parse money-like columns as numbers.
-            if (col.endsWith('_id') || col.includes('date') || col === 'status' ||
-                col === 'direction' || col === 'flexibility' || col === 'currency' ||
-                col === 'home_currency' || col === 'payment_method' ||
-                col === 'request_type' || col === 'allows_partial_payment' ||
-                col === 'event_type' || col === 'category' || col === 'description') {
-                return String(value);
-            }
-            const n = Number(value);
-            return Number.isFinite(n) ? n : String(value);
-        },
-    });
-}
+    const requests = readCsv(resolve(dsDir, 'requests.csv'));
+    const profiles = readCsv(resolve(dsDir, 'financial_profiles.csv'));
+    const events = readCsv(resolve(dsDir, 'financial_events.csv'));
+    const options = readCsv(resolve(dsDir, 'request_payment_options.csv'));
+    const messages = readCsv(resolve(dsDir, 'messages.csv'));
+    const images = readCsv(resolve(dsDir, 'images.csv'));
+    const ratesRaw = readCsv(resolve(dsDir, 'exchange_rates.csv'));
 
-export function loadAllData() {
-    const requests = readCsv('requests.csv');
-    const sampleRequests = readCsv('sample_requests.csv');
-    const profiles = readCsv('financial_profiles.csv');
-    const events = readCsv('financial_events.csv');
-    const paymentOptions = readCsv('request_payment_options.csv');
-    const exchangeRates = readCsv('exchange_rates.csv');
-    const messages = readCsv('messages.csv');
-    const images = readCsv('images.csv');
+    // ---- indexes -----------------------------------------------------------
+    const requestsById = new Map();
+    for (const r of requests) requestsById.set(r.request_id, r);
 
-    const profilesMap = new Map(profiles.map(p => [String(p.user_id), p]));
+    const profilesMap = new Map();
+    for (const p of profiles) profilesMap.set(p.user_id, p);
 
     const eventsByUser = new Map();
+    const eventById = new Map();
     for (const e of events) {
-        const uid = String(e.user_id || '');
-        if (!eventsByUser.has(uid)) eventsByUser.set(uid, []);
-        eventsByUser.get(uid).push(e);
+        eventById.set(e.event_id, e);
+        if (!eventsByUser.has(e.user_id)) eventsByUser.set(e.user_id, []);
+        eventsByUser.get(e.user_id).push(e);
     }
-    // sort each user's events by event_date
-    for (const list of eventsByUser.values()) {
-        list.sort((a, b) => String(a.event_date || '').localeCompare(String(b.event_date || '')));
+    for (const [uid, list] of eventsByUser) {
+        list.sort((a, b) => {
+            const da = a.settlement_date || a.event_date;
+            const db = b.settlement_date || b.event_date;
+            if (da !== db) return da < db ? -1 : 1;
+            return a.event_id < b.event_id ? -1 : 1;
+        });
     }
 
     const optionsByRequest = new Map();
-    for (const o of paymentOptions) {
-        const rid = String(o.request_id || '');
-        if (!optionsByRequest.has(rid)) optionsByRequest.set(rid, []);
-        optionsByRequest.get(rid).push(o);
+    for (const o of options) {
+        if (!optionsByRequest.has(o.request_id)) optionsByRequest.set(o.request_id, []);
+        optionsByRequest.get(o.request_id).push(o);
     }
 
     const messagesByUser = new Map();
     for (const m of messages) {
-        const uid = String(m.user_id || '');
-        if (!messagesByUser.has(uid)) messagesByUser.set(uid, []);
-        messagesByUser.get(uid).push(m);
+        if (!messagesByUser.has(m.user_id)) messagesByUser.set(m.user_id, []);
+        messagesByUser.get(m.user_id).push(m);
     }
 
     const imagesByEvent = new Map();
-    for (const img of images) {
-        if (img.related_event_id) imagesByEvent.set(String(img.related_event_id), img);
-    }
     const imagesByRequest = new Map();
     for (const img of images) {
-        if (img.request_id) {
-            const rid = String(img.request_id);
-            if (!imagesByRequest.has(rid)) imagesByRequest.set(rid, []);
-            imagesByRequest.get(rid).push(img);
+        if (img.related_event_id) imagesByEvent.set(img.related_event_id, img.image_id);
+        if (img.request_id) imagesByRequest.set(img.request_id, img.image_id);
+    }
+
+    // ---- FX ----------------------------------------------------------------
+    const rates = buildRates(ratesRaw);
+
+    // ---- image-amount resolution ------------------------------------------
+    // Any event whose amount is blank MUST have its amount resolved before
+    // forecast. We attempt resolution here using a precomputed OCR cache
+    // (code/dataset/image_amounts.json), which is produced separately by
+    // code/dataset/ocr.js. If an amount can't be resolved, we leave it blank
+    // and let the forecaster report it as unresolved.
+    const amountCache = loadAmountCache(resolve(repoRoot, 'code', 'dataset', 'image_amounts.json'));
+    for (const e of events) {
+        if (e.amount === '' || e.amount == null) {
+            const imgId = imagesByEvent.get(e.event_id);
+            if (imgId && amountCache[imgId] != null) {
+                const n = Number(amountCache[imgId]);
+                if (Number.isFinite(n) && n > 0 && n < 1e12) {
+                    e.amount = String(n);
+                } else {
+                    console.warn(`loader: rejecting implausible OCR amount ${amountCache[imgId]} for ${e.event_id} (${imgId})`);
+                }
+            }
         }
     }
 
     return {
-        requests, sampleRequests, profilesMap, events, eventsByUser,
-        paymentOptions, optionsByRequest, exchangeRates,
-        messages, messagesByUser, images, imagesByEvent, imagesByRequest,
+        requests: requests.sort((a, b) => a.request_id.localeCompare(b.request_id)),
+        requestsById,
+        profilesMap,
+        eventsByUser,
+        eventById,
+        optionsByRequest,
+        messagesByUser,
+        imagesByEvent,
+        imagesByRequest,
+        rates,
     };
 }
 
-export { DATASET_DIR };
+// ---- helpers --------------------------------------------------------------
+
+function readCsv(path) {
+    if (!existsSync(path)) {
+        throw new Error(`loader: missing ${path}`);
+    }
+    const raw = readFileSync(path, 'utf8');
+    return parse(raw, {
+        columns: true,
+        skip_empty_lines: true,
+        relax_quotes: true,
+        relax_column_count: true,
+        trim: false,
+    });
+}
+
+function loadAmountCache(path) {
+    if (!existsSync(path)) return {};
+    try {
+        return JSON.parse(readFileSync(path, 'utf8'));
+    } catch {
+        return {};
+    }
+}
+
+/**
+ * FX lookup. Matches by (from, to) and rate_date on-or-before the target
+ * date. Falls back to inverse direction. Throws on missing rate — we do
+ * NOT silently return the raw amount (that was the original currency.js bug).
+ */
+function buildRates(rows) {
+    // byPair: Map<"FROM>TO", Array<{date, rate}> sorted by date asc>
+    const byPair = new Map();
+    for (const r of rows) {
+        const key = `${r.from_currency}>${r.to_currency}`;
+        if (!byPair.has(key)) byPair.set(key, []);
+        byPair.get(key).push({ date: r.rate_date, rate: Number(r.rate) });
+    }
+    for (const [, list] of byPair) {
+        list.sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : 0));
+    }
+
+    function lookup(from, to, date) {
+        if (from === to) return 1;
+
+        const direct = byPair.get(`${from}>${to}`);
+        if (direct) {
+            const r = pickOnOrBefore(direct, date);
+            if (r != null) return r;
+        }
+
+        const inv = byPair.get(`${to}>${from}`);
+        if (inv) {
+            const r = pickOnOrBefore(inv, date);
+            if (r != null && r !== 0) return 1 / r;
+        }
+
+        return null;
+    }
+
+    function pickOnOrBefore(sorted, date) {
+        // binary search: largest date <= target
+        let lo = 0, hi = sorted.length - 1, best = null;
+        while (lo <= hi) {
+            const mid = (lo + hi) >> 1;
+            if (sorted[mid].date <= date) { best = sorted[mid].rate; lo = mid + 1; }
+            else hi = mid - 1;
+        }
+        return best;
+    }
+
+    return {
+        convert(amount, from, to, date) {
+            const rate = lookup(from, to, date);
+            if (rate == null) {
+                throw new Error(`no FX rate ${from}->${to} on/before ${date}`);
+            }
+            return Number(amount) * rate;
+        },
+    };
+}

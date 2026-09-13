@@ -1,53 +1,185 @@
-// Spec ranking (6 levels):
-// 1. Complete the full request by desired_completion_date
-// 2. Require no spending changes
-// 3. Minimize total amount paid
-// 4. Start payment earlier
-// 5. Use fewer payments
-// 6. Use the lowest payment_option_id
-export function rankPlans(plans, request) {
-    const deadline = String(request.desired_completion_date);
-    const safe = plans.filter(p => p.isSafe && p.strategy !== 'not_recommended');
-    if (!safe.length) {
-        return plans.find(p => p.strategy === 'not_recommended');
+// code/engine/rank.js
+import { buildPlans } from './plans.js';
+import { generateSpendingChangeSets } from './spending.js';
+import { overridesFrom, round2 } from './utils.js';
+
+/**
+ * Pick the single winning candidate for a request per the spec's 6-level
+ * ranking. Engine primitives (forecast, safeAmountToday) come from ctx.engine
+ * so there are no cross-module imports.
+ */
+export function pickBest(ctx, request) {
+    const { profile, engine } = ctx;
+    const home = profile.home_currency;
+    const minBal = Number(profile.minimum_balance_to_keep);
+    const requested = Number(request.requested_amount);
+
+    const rawPlans = buildPlans(ctx, request);
+    const candidates = [];
+
+    for (const plan of rawPlans) {
+        if (plan.method === 'not_recommended') {
+            candidates.push(makeCandidate(plan, null, request, ctx));
+            continue;
+        }
+
+        const feasibleAsIs = isFeasible(ctx, plan.schedule, null);
+        if (feasibleAsIs) {
+            candidates.push(makeCandidate(plan, null, request, ctx));
+            continue;
+        }
+
+        const changeSets = generateSpendingChangeSets(ctx, request, plan.schedule);
+        const feasibleSets = changeSets.filter(s => s.feasible);
+        if (feasibleSets.length === 0) continue;
+
+        feasibleSets.sort((a, b) =>
+            a.changes.length - b.changes.length || b.savings - a.savings
+        );
+        candidates.push(makeCandidate(plan, feasibleSets[0], request, ctx));
     }
 
-    const completesBy = (p) => {
-        if (!p.startDate && p.strategy !== 'not_recommended') return true;
-        if (p.strategy === 'not_recommended') return false;
-        const last = p.paymentEvents.length
-            ? p.paymentEvents[p.paymentEvents.length - 1].eventDate
-            : p.startDate;
-        return last <= deadline;
+    const fullRescue = tryFullPaymentRescue(ctx, request);
+    if (fullRescue) candidates.push(fullRescue);
+
+    candidates.sort(compareCandidates);
+
+    const winner = candidates[0];
+    if (!winner) {
+        return {
+            status: 'not_affordable',
+            method: 'not_recommended',
+            amountSafeToPay: 0,
+            schedule: [],
+            spendingChanges: [],
+            earliestFullPayment: '',
+            explanationKey: 'none_options',
+        };
+    }
+    return winner;
+}
+
+function tryFullPaymentRescue(ctx, request) {
+    const { profile } = ctx;
+    const requested = Number(request.requested_amount);
+    const reqDate = request.request_date;
+
+    const schedule = [{ date: reqDate, amount: requested }];
+    const changeSets = generateSpendingChangeSets(ctx, request, schedule);
+    const feasibleSets = changeSets.filter(s => s.feasible);
+    if (feasibleSets.length === 0) return null;
+
+    feasibleSets.sort((a, b) =>
+        a.changes.length - b.changes.length || b.savings - a.savings
+    );
+    const chosen = feasibleSets[0];
+
+    const overrides = overridesFrom(chosen.changes);
+    const safeToday = ctx.engine.safeAmountToday(ctx, request, requested, overrides);
+
+    return makeCandidate(
+        {
+            method: 'full_payment',
+            schedule,
+            spendingChanges: chosen.changes,
+            safeToday,
+            completesBy: reqDate,
+            optionId: null,
+        },
+        chosen,
+        request,
+        ctx
+    );
+}
+
+function makeCandidate(plan, spendingSet, request, ctx) {
+    const { profile, engine } = ctx;
+    const requested = Number(request.requested_amount);
+
+    const changes = spendingSet ? spendingSet.changes : (plan.spendingChanges || []);
+    const schedule = plan.schedule || [];
+
+    let cost = schedule.reduce((s, p) => s + Number(p.amount), 0);
+    if (plan.method === 'installments' && plan.optionId) {
+        const opt = (ctx.optionsByRequest.get(request.request_id) || [])
+            .find(o => o.payment_option_id === plan.optionId);
+        if (opt && opt.financing_fee) cost += Number(opt.financing_fee);
+    }
+
+    const paidFull = cost >= requested - 0.01;
+    const earliestFullPayment = paidFull && schedule.length > 0
+        ? schedule[schedule.length - 1].date
+        : '';
+
+    let status, method;
+    if (plan.method === 'not_recommended') {
+        status = 'not_affordable'; method = 'not_recommended';
+    } else if (plan.method === 'wait') {
+        status = 'affordable_later'; method = 'wait';
+    } else if (plan.method === 'installments') {
+        status = 'affordable_with_plan'; method = 'installments';
+    } else if (plan.method === 'partial_payment') {
+        status = 'affordable_with_plan'; method = 'partial_payment';
+    } else if (plan.method === 'full_payment') {
+        if (changes.length > 0) {
+            status = 'affordable_with_plan'; method = 'full_payment';
+        } else if (schedule.length === 1 && schedule[0].date === request.request_date) {
+            status = 'affordable_now'; method = 'full_payment';
+        } else {
+            status = 'affordable_with_plan'; method = 'full_payment';
+        }
+    } else {
+        status = 'not_affordable'; method = 'not_recommended';
+    }
+
+    let explanationKey = null;
+    if (status === 'not_affordable') {
+        const allowsPartial = String(request.allows_partial_payment).toLowerCase() === 'true';
+        explanationKey = allowsPartial ? 'available_today_but_incomplete' : 'none_options';
+    }
+
+    return {
+        status,
+        method,
+        amountSafeToPay: round2(Math.min(plan.safeToday ?? 0, requested)),
+        schedule,
+        spendingChanges: changes,
+        earliestFullPayment,
+        cost: round2(cost),
+        completesByDesired: plan.completesBy
+            ? plan.completesBy <= request.desired_completion_date
+            : false,
+        paymentOptionId: plan.optionId || null,
+        explanationKey,
+        _plan: plan,
     };
+}
 
-    safe.sort((a, b) => {
-        // 1. completes by deadline
-        const ca = completesBy(a) ? 0 : 1;
-        const cb = completesBy(b) ? 0 : 1;
-        if (ca !== cb) return ca - cb;
+function compareCandidates(a, b) {
+    if (a.completesByDesired !== b.completesByDesired) {
+        return a.completesByDesired ? -1 : 1;
+    }
+    const aNo = a.spendingChanges.length === 0;
+    const bNo = b.spendingChanges.length === 0;
+    if (aNo !== bNo) return aNo ? -1 : 1;
+    if (Math.abs(a.cost - b.cost) > 1e-9) return a.cost - b.cost;
+    const aStart = a.schedule.length ? a.schedule[0].date : '9999-99-99';
+    const bStart = b.schedule.length ? b.schedule[0].date : '9999-99-99';
+    if (aStart !== bStart) return aStart < bStart ? -1 : 1;
+    if (a.schedule.length !== b.schedule.length) {
+        return a.schedule.length - b.schedule.length;
+    }
+    const aId = a.paymentOptionId || '~';
+    const bId = b.paymentOptionId || '~';
+    return aId < bId ? -1 : aId > bId ? 1 : 0;
+}
 
-        // 2. no spending changes
-        const sa = a.spendingChanges === 'none' ? 0 : 1;
-        const sb = b.spendingChanges === 'none' ? 0 : 1;
-        if (sa !== sb) return sa - sb;
-
-        // 3. minimize total cost
-        if (Math.abs(a.totalCost - b.totalCost) > 0.01) return a.totalCost - b.totalCost;
-
-        // 4. start earlier
-        const da = a.startDate || '9999-99-99';
-        const db = b.startDate || '9999-99-99';
-        if (da !== db) return da.localeCompare(db);
-
-        // 5. fewer payments
-        if (a.numPayments !== b.numPayments) return a.numPayments - b.numPayments;
-
-        // 6. lowest payment_option_id
-        const ia = a.paymentOptionId || '';
-        const ib = b.paymentOptionId || '';
-        return ia.localeCompare(ib);
+function isFeasible(ctx, schedule, overrides) {
+    const { profile, engine } = ctx;
+    const home = profile.home_currency;
+    const f = engine.forecast(ctx, {
+        extraDebits: schedule.map(p => ({ date: p.date, amount: p.amount, currency: home })),
+        overrides,
     });
-
-    return safe[0];
+    return f.lowestBalance >= Number(profile.minimum_balance_to_keep) - 1e-9;
 }

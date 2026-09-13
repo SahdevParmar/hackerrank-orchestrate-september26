@@ -5,7 +5,8 @@
   "main": "main.js",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
-    "start": "node main.js",
+    "start": "node code/main.js",
+    "ocr": "node code/dataset/ocr.js",
     "eval": "node evaluation/eval.js"
   },
   "keywords": [],
