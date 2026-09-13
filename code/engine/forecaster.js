@@ -1,38 +1,24 @@
 // code/engine/forecaster.js
 import { parseISO, toISO, addDays, round2 } from './utils.js';
+import { detectRecurring, projectRecurring } from './recurrence.js';
 
 const DAY_MS = 86400000;
-const HORIZON_DAYS = 90;
+const MAX_HORIZON_DAYS = 90;
 
 /**
- * 90-day daily balance projection.
+ * Forecast the user's daily balance from request_date forward.
  *
- * Contract:
- *   forecast(ctx, opts?) -> {
- *     timeline: [{date, balance, inflows, outflows}],
- *     lowestBalance: number,
- *     lowestDate: string,
- *     breaches: string[],       // dates where balance < minBalance
- *     minBalance: number,
- *     startBalance: number,
- *     unresolved: string[]      // event_ids whose amount couldn't be resolved
- *   }
- *
- * opts:
- *   extraDebits: [{date, amount, currency}]  — hypothetical payments to test
- *   overrides:   Map<event_id, {skip?:true, newAmount?:number}>
+ * Window:
+ *   endDate = min(request_date + 90d, max(request_date + 30d, desired_completion_date))
  *
  * Rules enforced:
- *   - Only events with status in {settled, scheduled, pending} are counted.
- *     cancelled / failed / unrealized are dropped (unless overridden).
- *   - pending CREDITS are NOT counted (spec: don't count until settled).
- *   - pending DEBITS ARE reserved (they'll hit the account).
+ *   - Real events with status settled or pending are counted.
+ *   - Real events with status scheduled are counted ONLY if direction is credit.
+ *   - pending CREDITS are NOT counted.
  *   - investment_valuation (non_cash) is never counted.
- *   - Every amount is converted to home_currency on its settlement date.
- *   - extraDebits are applied on their date, in home currency, after
- *     regular events, so they stack correctly.
- *   - overrides: skip=true removes the event entirely; newAmount replaces
- *     the amount (still on the same settlement date).
+ *   - Projected recurring events (from recurrence.js) are added on top.
+ *   - Amounts converted to home_currency on their settlement date.
+ *   - extraDebits applied on their date, in home currency.
  */
 export function forecast(ctx, opts = {}) {
     const { profile, eventsByUser, rates } = ctx;
@@ -40,52 +26,68 @@ export function forecast(ctx, opts = {}) {
     const minBalance = Number(profile.minimum_balance_to_keep);
     const startBalance = Number(profile.current_available_balance);
 
-    const userId = opts.userId || (opts.request && opts.request.user_id);
+    const userId = opts.userId
+        || (opts.request && opts.request.user_id)
+        || ctx.currentUserId;
     if (!userId) throw new Error('forecast: userId required (opts.userId or opts.request)');
 
-    const startDate = opts.startDate || (opts.request && opts.request.request_date);
+    const startDate = opts.startDate
+        || (opts.request && opts.request.request_date);
     if (!startDate) throw new Error('forecast: startDate required (opts.startDate or opts.request)');
+
+    // ---- Window selection --------------------------------------------------
+    // Base horizon = 90 days; shrink to desired_completion_date if that's
+    // sooner. Floor at 30 days so a near-term request still sees enough
+    // runway to catch recurring expenses.
+    let horizonDays = MAX_HORIZON_DAYS;
+    const desired = opts.request && opts.request.desired_completion_date;
+    if (desired && desired > startDate) {
+        const [sy, sm, sd] = startDate.split('-').map(Number);
+        const [dy, dm, dd] = desired.split('-').map(Number);
+        const diffDays = Math.round(
+            (Date.UTC(dy, dm - 1, dd) - Date.UTC(sy, sm - 1, sd)) / DAY_MS
+        );
+        horizonDays = Math.max(1, Math.min(MAX_HORIZON_DAYS, diffDays));
+    }
+
+    const endDate = addDays(startDate, horizonDays);
 
     const events = eventsByUser.get(userId) || [];
     const extraDebits = opts.extraDebits || [];
     const overrides = opts.overrides || null;
 
     const unresolved = [];
+    const flows = [];
 
-    // ---- 1. Normalize every event into (date, delta) in home currency -----
-    const flows = []; // {date, delta, eventId}
-
+    // ---- 1. Real countable events -----------------------------------------
     for (const e of events) {
         const ov = overrides ? overrides.get(e.event_id) : null;
         if (ov && ov.skip) continue;
 
-        if (!isCountableStatus(e.status)) continue;
+        // Count settled, pending, and scheduled CREDITS.
+        // Scheduled debits are not counted.
+        const isRealCountable =
+            e.status === 'settled' ||
+            e.status === 'pending' ||
+            (e.status === 'scheduled' && e.direction === 'credit');
+        if (!isRealCountable) continue;
+
         if (e.direction === 'non_cash') continue;
         if (e.event_type === 'investment_valuation') continue;
 
-        // Resolve amount (blank => image-linked; must already be filled by loader).
         let amtRaw = e.amount;
         if (ov && ov.newAmount != null) amtRaw = ov.newAmount;
-        if (amtRaw === '' || amtRaw == null) {
-            unresolved.push(e.event_id);
-            continue;
-        }
+        if (amtRaw === '' || amtRaw == null) { unresolved.push(e.event_id); continue; }
         const amt = Number(amtRaw);
-        if (!Number.isFinite(amt)) {
-            unresolved.push(e.event_id);
-            continue;
-        }
+        if (!Number.isFinite(amt)) { unresolved.push(e.event_id); continue; }
 
-        // Pending credits are NOT counted. Pending debits ARE.
         if (e.status === 'pending' && e.direction === 'credit') continue;
 
-        // Settlement date is the cash date; fall back to event_date.
         const date = e.settlement_date || e.event_date;
         if (!date) continue;
-        if (date < startDate) continue;              // already happened
-        if (date > addDays(startDate, HORIZON_DAYS)) continue; // outside window
+        if (date < startDate) continue;
+        if (date > endDate) continue;
 
-        // Convert to home currency on the settlement date.
         let amtHome;
         if (e.currency === home) {
             amtHome = amt;
@@ -101,7 +103,33 @@ export function forecast(ctx, opts = {}) {
         flows.push({ date, delta: sign * amtHome, eventId: e.event_id });
     }
 
-    // ---- 2. Fold in hypothetical debits (already in home currency) ---------
+    // ---- 2. Projected recurring events ------------------------------------
+    const recurring = detectRecurring(events, startDate);
+    const projected = projectRecurring(recurring, startDate, horizonDays, events);
+
+    for (const p of projected) {
+        const date = p.settlement_date || p.event_date;
+        if (!date || date < startDate || date > endDate) continue;
+
+        const amt = Number(p.amount);
+        if (!Number.isFinite(amt) || amt <= 0) continue;
+
+        let amtHome;
+        if (p.currency === home) {
+            amtHome = amt;
+        } else {
+            try {
+                amtHome = rates.convert(amt, p.currency, home, date);
+            } catch {
+                continue;
+            }
+        }
+
+        const sign = p.direction === 'credit' ? +1 : -1;
+        flows.push({ date, delta: sign * amtHome, eventId: p.event_id });
+    }
+
+    // ---- 3. Hypothetical debits -------------------------------------------
     for (const x of extraDebits) {
         let amtHome;
         if (!x.currency || x.currency === home) amtHome = Number(x.amount);
@@ -109,30 +137,26 @@ export function forecast(ctx, opts = {}) {
         flows.push({ date: x.date, delta: -amtHome, eventId: x.eventId || '__extra__' });
     }
 
-    // ---- 3. Sort by date; stable within a day: credits before debits? ------
-    // Spec is ambiguous. We apply debits-then-credits within a day so the
-    // lowest intraday balance is captured (conservative).
+    // ---- 4. Sort: by date, debits before credits within a day -------------
     flows.sort((a, b) => {
         if (a.date !== b.date) return a.date < b.date ? -1 : 1;
-        return a.delta - b.delta; // more negative (debit) first
+        return a.delta - b.delta;
     });
 
-    // ---- 4. Walk day by day ------------------------------------------------
+    // ---- 5. Walk day by day ----------------------------------------------
     const timeline = [];
     const breaches = [];
     let balance = startBalance;
     let lowestBalance = startBalance;
     let lowestDate = startDate;
 
-    // Index flows by date for O(1) lookup.
     const byDate = new Map();
     for (const f of flows) {
         if (!byDate.has(f.date)) byDate.set(f.date, []);
         byDate.get(f.date).push(f);
     }
 
-    const endDate = addDays(startDate, HORIZON_DAYS);
-    for (let d = 0; d <= HORIZON_DAYS; d++) {
+    for (let d = 0; d <= horizonDays; d++) {
         const date = addDays(startDate, d);
         const dayFlows = byDate.get(date) || [];
         let inflows = 0, outflows = 0;
@@ -157,9 +181,6 @@ export function forecast(ctx, opts = {}) {
         minBalance,
         startBalance,
         unresolved,
+        horizonDays,
     };
-}
-
-function isCountableStatus(status) {
-    return status === 'settled' || status === 'scheduled' || status === 'pending';
 }

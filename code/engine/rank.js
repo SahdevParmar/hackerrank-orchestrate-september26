@@ -4,14 +4,10 @@ import { generateSpendingChangeSets } from './spending.js';
 import { overridesFrom, round2 } from './utils.js';
 
 /**
- * Pick the single winning candidate for a request per the spec's 6-level
- * ranking. Engine primitives (forecast, safeAmountToday) come from ctx.engine
- * so there are no cross-module imports.
+ * Pick the winning candidate for a request per the spec's 6-level ranking.
  */
 export function pickBest(ctx, request) {
-    const { profile, engine } = ctx;
-    const home = profile.home_currency;
-    const minBal = Number(profile.minimum_balance_to_keep);
+    const { profile } = ctx;
     const requested = Number(request.requested_amount);
 
     const rawPlans = buildPlans(ctx, request);
@@ -23,12 +19,13 @@ export function pickBest(ctx, request) {
             continue;
         }
 
-        const feasibleAsIs = isFeasible(ctx, plan.schedule, null);
+        const feasibleAsIs = isFeasible(ctx, request, plan.schedule, null);
         if (feasibleAsIs) {
             candidates.push(makeCandidate(plan, null, request, ctx));
             continue;
         }
 
+        // Plan not feasible as-is. Try spending changes to rescue it.
         const changeSets = generateSpendingChangeSets(ctx, request, plan.schedule);
         const feasibleSets = changeSets.filter(s => s.feasible);
         if (feasibleSets.length === 0) continue;
@@ -39,6 +36,8 @@ export function pickBest(ctx, request) {
         candidates.push(makeCandidate(plan, feasibleSets[0], request, ctx));
     }
 
+    // Full-payment-today rescue: pay the full amount today, cover the gap
+    // with spending changes.
     const fullRescue = tryFullPaymentRescue(ctx, request);
     if (fullRescue) candidates.push(fullRescue);
 
@@ -60,7 +59,6 @@ export function pickBest(ctx, request) {
 }
 
 function tryFullPaymentRescue(ctx, request) {
-    const { profile } = ctx;
     const requested = Number(request.requested_amount);
     const reqDate = request.request_date;
 
@@ -93,7 +91,6 @@ function tryFullPaymentRescue(ctx, request) {
 }
 
 function makeCandidate(plan, spendingSet, request, ctx) {
-    const { profile, engine } = ctx;
     const requested = Number(request.requested_amount);
 
     const changes = spendingSet ? spendingSet.changes : (plan.spendingChanges || []);
@@ -155,6 +152,15 @@ function makeCandidate(plan, spendingSet, request, ctx) {
     };
 }
 
+/**
+ * Spec's 6-level ranking:
+ *   1. completes by desired_completion_date     (true > false)
+ *   2. no spending changes                      (true > false)
+ *   3. minimize total cost                      (lower > higher)
+ *   4. earlier start                            (earlier > later)
+ *   5. fewer payments                           (fewer > more)
+ *   6. lowest payment_option_id                 (lex asc; null sorts last)
+ */
 function compareCandidates(a, b) {
     if (a.completesByDesired !== b.completesByDesired) {
         return a.completesByDesired ? -1 : 1;
@@ -174,10 +180,11 @@ function compareCandidates(a, b) {
     return aId < bId ? -1 : aId > bId ? 1 : 0;
 }
 
-function isFeasible(ctx, schedule, overrides) {
+function isFeasible(ctx, request, schedule, overrides) {
     const { profile, engine } = ctx;
     const home = profile.home_currency;
     const f = engine.forecast(ctx, {
+        request,
         extraDebits: schedule.map(p => ({ date: p.date, amount: p.amount, currency: home })),
         overrides,
     });

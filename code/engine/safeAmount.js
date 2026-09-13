@@ -1,5 +1,6 @@
 // code/engine/safeAmount.js
-import { round2, parseISO, toISO } from './utils.js';
+import { round2, parseISO, toISO, addDays } from './utils.js';
+import { detectRecurring, projectRecurring } from './recurrence.js';
 
 const DAY_MS = 86400000;
 
@@ -34,19 +35,57 @@ export function safeAmountToday(ctx, request, cap, overrides = null) {
 }
 
 export function earliestFullPaymentDate(ctx, request) {
-    const { profile } = ctx;
+    const { profile, eventsByUser } = ctx;
     const minBal = Number(profile.minimum_balance_to_keep);
-    const start = parseISO(request.request_date);
+    const home = profile.home_currency;
+    const start = request.request_date;
     const horizon = 90;
 
-    for (let d = 0; d <= horizon; d++) {
-        const date = toISO(new Date(start.getTime() + d * DAY_MS));
+    const incomeDates = new Set();
+
+    // Real credit events at/after request_date
+    const events = eventsByUser.get(request.user_id) || [];
+    for (const e of events) {
+        if (e.direction !== 'credit') continue;
+        const d = e.settlement_date || e.event_date;
+        if (!d || d < request.request_date) continue;
+        if (d > addDays(request.request_date, horizon)) continue;
+        incomeDates.add(d);
+    }
+
+    // Projected recurring credit dates
+    const recurring = detectRecurring(events, request.request_date);
+    const projected = projectRecurring(recurring, request.request_date, horizon, events);
+    for (const p of projected) {
+        if (p.direction !== 'credit') continue;
+        const d = p.settlement_date || p.event_date;
+        if (d && d >= request.request_date && d <= addDays(request.request_date, horizon)) {
+            incomeDates.add(d);
+        }
+    }
+
+    const isSafeOn = (date) => {
         const f = ctx.engine.forecast(ctx, {
             request,
-            extraDebits: [{ date, amount: Number(request.requested_amount), currency: profile.home_currency }],
+            extraDebits: [{ date, amount: Number(request.requested_amount), currency: home }],
         });
-        if (f.lowestBalance >= minBal - 1e-9) return date;
+        return f.lowestBalance >= minBal - 1e-9;
+    };
+
+    // Pass 1: income dates
+    const sortedIncome = [...incomeDates].sort();
+    for (const date of sortedIncome) {
+        if (isSafeOn(date)) return date;
     }
+
+    // Pass 2: any day
+    const startMs = parseISO(start).getTime();
+    for (let d = 0; d <= horizon; d++) {
+        const date = toISO(new Date(startMs + d * DAY_MS));
+        if (incomeDates.has(date)) continue;
+        if (isSafeOn(date)) return date;
+    }
+
     return null;
 }
 
@@ -58,7 +97,11 @@ export function earliestCompletionDate(ctx, request, schedule) {
 
     const f = ctx.engine.forecast(ctx, {
         request,
-        extraDebits: schedule.map(p => ({ date: p.date, amount: Number(p.amount), currency: profile.home_currency })),
+        extraDebits: schedule.map(p => ({
+            date: p.date,
+            amount: Number(p.amount),
+            currency: profile.home_currency,
+        })),
     });
     if (f.lowestBalance < minBal - 1e-9) return null;
     return schedule[schedule.length - 1].date;

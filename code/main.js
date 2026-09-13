@@ -47,6 +47,7 @@ async function main() {
         // ---- 2. Build context ----------------------------------------------
         const ctx = {
             profile: null,               // set per-request
+            currentUserId: null,         // set per-request (forecast fallback)
             profilesMap: data.profilesMap,
             eventsByUser: data.eventsByUser,
             eventById: data.eventById,
@@ -78,9 +79,9 @@ async function main() {
                 continue;
             }
 
-            // Set the per-request profile on ctx so engine modules read the
-            // right home_currency / minimum_balance_to_keep.
+            // Per-request context: profile + userId fallback for forecast.
             ctx.profile = profile;
+            ctx.currentUserId = request.user_id;
 
             let candidate;
             try {
@@ -88,7 +89,10 @@ async function main() {
             } catch (err) {
                 warnings.push(`${request.request_id}: pickBest threw: ${err.message}`);
                 rows.push(emptyRow(request.request_id));
-                log(`error request=${request.request_id} ${err.stack}`);
+                // Only log the full stack for the first few failures to keep
+                // log.txt readable; then just the message.
+                if (warnings.length <= 5) log(`error request=${request.request_id} ${err.stack}`);
+                else log(`error request=${request.request_id} ${err.message}`);
                 continue;
             }
 
@@ -98,7 +102,8 @@ async function main() {
             } catch (err) {
                 warnings.push(`${request.request_id}: explain threw: ${err.message}`);
                 explanation = fallbackExplanation(ctx, request, candidate);
-                log(`error request=${request.request_id} explain: ${err.stack}`);
+                if (warnings.length <= 5) log(`error request=${request.request_id} explain: ${err.stack}`);
+                else log(`error request=${request.request_id} explain: ${err.message}`);
             }
 
             rows.push({
