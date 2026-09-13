@@ -1,208 +1,334 @@
-// code/engine/recurrence.js
-// Infer recurrence from settled history. The dataset has no recurrence labels,
-// so we detect cadence from the gaps between consecutive occurrences.
+// Infer recurring events from settled historical transactions.
+//
+// Supported cadences:
+//   - Weekly: 7 days
+//   - Biweekly: 14 days
+//   - Monthly: calendar-month progression
+//
+// Only settled events are used to infer recurrence.
+// Pending and scheduled events are not historical evidence.
 
 const DAY_MS = 86400000;
 
-function median(nums) {
-    if (!nums.length) return 0;
-    const s = [...nums].sort((a, b) => a - b);
-    const m = Math.floor(s.length / 2);
-    return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2;
+function median(numbers) {
+    if (!numbers.length) return 0;
+    const sorted = [...numbers].sort((a, b) => a - b);
+    const middle = Math.floor(sorted.length / 2);
+    if (sorted.length % 2 === 1) return sorted[middle];
+    return (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+function getDate(event) {
+    return event.settlement_date || event.event_date;
+}
+
+function isValidDate(date) {
+    return typeof date === 'string' &&
+        /^\d{4}-\d{2}-\d{2}$/.test(date) &&
+        !Number.isNaN(Date.parse(`${date}T00:00:00Z`));
 }
 
 function daysBetween(a, b) {
-    const [ay, am, ad] = a.split('-').map(Number);
-    const [by, bm, bd] = b.split('-').map(Number);
-    return Math.round((Date.UTC(by, bm - 1, bd) - Date.UTC(ay, am - 1, ad)) / DAY_MS);
+    const start = Date.parse(`${a}T00:00:00Z`);
+    const end = Date.parse(`${b}T00:00:00Z`);
+    return Math.round((end - start) / DAY_MS);
+}
+
+function addDays(date, days) {
+    const ms = Date.parse(`${date}T00:00:00Z`) + days * DAY_MS;
+    return new Date(ms).toISOString().slice(0, 10);
+}
+
+function addMonthsClamped(date, months) {
+    const [year, month, day] = date.split('-').map(Number);
+    const targetMonth = month - 1 + months;
+    const targetYear = year + Math.floor(targetMonth / 12);
+    const normalizedMonth = ((targetMonth % 12) + 12) % 12;
+    const lastDay = new Date(
+        Date.UTC(targetYear, normalizedMonth + 1, 0)
+    ).getUTCDate();
+    const clampedDay = Math.min(day, lastDay);
+    return [
+        targetYear,
+        String(normalizedMonth + 1).padStart(2, '0'),
+        String(clampedDay).padStart(2, '0'),
+    ].join('-');
+}
+
+function snapCadence(gap) {
+    if (gap >= 5 && gap <= 10) return 7;
+    if (gap >= 11 && gap <= 18) return 14;
+    if (gap >= 25 && gap <= 35) return 30;
+    return null;
 }
 
 /**
- * Detect recurring patterns in a user's settled history.
- * Returns one descriptor per (category, event_type, direction) that recurs.
+ * Choose the cadence for a group of gaps.
+ * Prefers the LARGEST cadence among candidates that are supported by
+ * at least 3 gaps. Rationale: a user with monthly AND weekly occurrences
+ * of the same category (e.g. salary + bonuses) should have the monthly
+ * cadence treated as the recurring baseline.
  */
-export function detectRecurring(events, asOfDate) {
-    const groups = new Map();
-    for (const e of events) {
-        if (e.status !== 'settled') continue;
-        if (e.direction === 'non_cash') continue;
-        if (e.event_type === 'investment_valuation') continue;
-        const date = e.settlement_date || e.event_date;
-        if (!date || date > asOfDate) continue;
-        const key = `${e.category}|${e.event_type}|${e.direction}`;
-        if (!groups.has(key)) groups.set(key, []);
-        groups.get(key).push(e);
+function chooseCadence(gaps) {
+    const counts = new Map();
+
+    for (const gap of gaps) {
+        const cadence = snapCadence(gap);
+        if (cadence == null) continue;
+        counts.set(cadence, (counts.get(cadence) || 0) + 1);
     }
 
-    const out = [];
-    for (const [key, list] of groups) {
-        if (list.length < 3) continue;
+    if (counts.size === 0) return null;
 
-        list.sort((a, b) =>
-            (a.settlement_date || a.event_date) < (b.settlement_date || b.event_date) ? -1 : 1
-        );
-        const dates = list.map(e => e.settlement_date || e.event_date);
+    const viable = [...counts.entries()].filter(([, n]) => n >= 3);
+    if (viable.length === 0) return null;
 
-        const gaps = [];
-        for (let i = 1; i < dates.length; i++) {
-            gaps.push(daysBetween(dates[i - 1], dates[i]));
+    viable.sort((a, b) => b[0] - a[0]);
+    return viable[0][0];
+}
+
+function chooseAmount(events) {
+    const amounts = events
+        .map(event => Number(event.amount))
+        .filter(amount => Number.isFinite(amount) && amount > 0);
+
+    if (amounts.length < 3) return null;
+
+    const amount = median(amounts);
+    return amount > 0 ? amount : null;
+}
+
+function latestMetadata(events) {
+    let flexibility = '';
+    let minimumAllowedAmount = '';
+
+    for (let i = events.length - 1; i >= 0; i--) {
+        const event = events[i];
+
+        if (!flexibility && event.flexibility) {
+            flexibility = String(event.flexibility).trim();
         }
 
-        // Snap each gap to the nearest canonical cadence.
-        const snapped = gaps.map(g => {
-            if (g >= 5 && g <= 10) return 7;    // weekly
-            if (g >= 11 && g <= 18) return 14;  // biweekly
-            if (g >= 25 && g <= 35) return 30;  // monthly
-            return null;                         // irregular
+        if (
+            !minimumAllowedAmount &&
+            event.minimum_allowed_amount != null &&
+            String(event.minimum_allowed_amount).trim() !== ''
+        ) {
+            minimumAllowedAmount = String(
+                event.minimum_allowed_amount
+            ).trim();
+        }
+
+        if (flexibility && minimumAllowedAmount) break;
+    }
+
+    return { flexibility, minimumAllowedAmount };
+}
+
+function buildGroupKey(event) {
+    return [
+        event.category || '',
+        event.event_type || '',
+        event.direction || '',
+    ].join('|');
+}
+
+export function detectRecurring(events, asOfDate) {
+    const groups = new Map();
+
+    for (const event of events || []) {
+        if (!event || event.status !== 'settled') continue;
+        if (event.direction === 'non_cash') continue;
+        if (event.event_type === 'investment_valuation') continue;
+
+        const date = getDate(event);
+
+        if (!isValidDate(date)) continue;
+        if (date > asOfDate) continue;
+
+        const key = buildGroupKey(event);
+
+        if (!groups.has(key)) {
+            groups.set(key, []);
+        }
+
+        groups.get(key).push(event);
+    }
+
+    const recurring = [];
+
+    for (const [key, group] of groups) {
+        if (group.length < 3) continue;
+
+        const list = [...group].sort((a, b) => {
+            const da = getDate(a);
+            const db = getDate(b);
+
+            if (da === db) {
+                return String(a.event_id).localeCompare(String(b.event_id));
+            }
+
+            return da < db ? -1 : 1;
         });
 
-        const counts = new Map();
-        for (const s of snapped) {
-            if (s == null) continue;
-            counts.set(s, (counts.get(s) || 0) + 1);
+        const dates = list.map(getDate);
+        const gaps = [];
+
+        for (let i = 1; i < dates.length; i++) {
+            const gap = daysBetween(dates[i - 1], dates[i]);
+            if (gap > 0) gaps.push(gap);
         }
-        if (counts.size === 0) continue;
 
-        const viable = [...counts.entries()].filter(([, n]) => n >= 3);
-        if (viable.length === 0) continue;
+        const cadenceDays = chooseCadence(gaps);
+        if (cadenceDays == null) continue;
 
-        // Prefer the LARGEST cadence among viable candidates. Rationale:
-        // if a user has monthly AND weekly occurrences of the same category
-        // (e.g. salary + bonuses), the monthly cadence is the recurring
-        // baseline.
-        viable.sort((a, b) => b[0] - a[0]);
-        const bestCadence = viable[0][0];
+        const amount = chooseAmount(list);
+        if (amount == null) continue;
 
-        // Median amount over occurrences (not gaps).
-        const amounts = list
-            .map(e => Number(e.amount))
-            .filter(a => Number.isFinite(a) && a > 0);
-        if (amounts.length < 3) continue;
-        const medAmt = median(amounts);
-        if (medAmt <= 0) continue;
-
-        const last = list[list.length - 1];
+        const latest = list[list.length - 1];
+        const metadata = latestMetadata(list);
 
         // Semantic override: income, subscriptions, and debt payments are
         // monthly by definition, regardless of what the history gaps suggest.
         // This guards against misclassification when a category happens to
         // have weekly occurrences mixed in (e.g. salary + bonuses).
-        let finalCadence = bestCadence;
-        if (last.event_type === 'income' ||
-            last.event_type === 'subscription' ||
-            last.event_type === 'debt_payment') {
+        let finalCadence = cadenceDays;
+        if (
+            latest.event_type === 'income' ||
+            latest.event_type === 'subscription' ||
+            latest.event_type === 'debt_payment'
+        ) {
             finalCadence = 30;
         }
 
-        out.push({
+        recurring.push({
             key,
-            category: last.category,
-            eventType: last.event_type,
-            direction: last.direction,
-            currency: last.currency,
-            amount: medAmt,
+            category: latest.category,
+            eventType: latest.event_type,
+            direction: latest.direction,
+            currency: latest.currency,
+            amount,
             cadenceDays: finalCadence,
             lastDate: dates[dates.length - 1],
+            lastEventId: latest.event_id,
+            flexibility: metadata.flexibility,
+            minimumAllowedAmount: metadata.minimumAllowedAmount,
         });
     }
-    return out;
+
+    return recurring;
 }
 
-/**
- * Project recurring patterns forward from asOfDate for `days` days.
- *
- * For monthly cadences (30 days), steps by calendar month and anchors each
- * projection on the same day-of-month as the last observed event. This
- * matches how real bills and salaries actually recur (e.g. the 15th of
- * every month), rather than drifting by ±1–2 days each month.
- *
- * For non-monthly cadences (7, 14 days), steps by the cadence interval.
- *
- * Skips projections that collide with a real event on the same date in the
- * same (category, event_type, direction) group.
- */
-export function projectRecurring(recurring, asOfDate, days, realEvents = []) {
-    const out = [];
-    const startMs = Date.parse(asOfDate + 'T00:00:00Z');
-    const endMs = startMs + days * DAY_MS;
+function makeProjection(recurring, date, index) {
+    return {
+        event_id: `${recurring.key}_proj_${index}`,
+        patternKey: recurring.key,
+        sourceEventId: recurring.lastEventId,
 
-    // Index real event dates by group key so we can skip duplicates.
+        category: recurring.category,
+        event_type: recurring.eventType,
+        direction: recurring.direction,
+        currency: recurring.currency,
+
+        amount: recurring.amount,
+
+        event_date: date,
+        settlement_date: date,
+        status: '__projected__',
+
+        flexibility: recurring.flexibility || 'fixed',
+        minimum_allowed_amount:
+            recurring.minimumAllowedAmount || '',
+    };
+}
+
+function realEventSignature(event) {
+    const date = getDate(event);
+    if (!isValidDate(date)) return null;
+    return [
+        event.category || '',
+        event.event_type || '',
+        event.direction || '',
+        date,
+    ].join('|');
+}
+
+export function projectRecurring(
+    recurring,
+    asOfDate,
+    days,
+    realEvents = []
+) {
+    const out = [];
+
+    if (!isValidDate(asOfDate)) return out;
+
+    const endDate = addDays(asOfDate, days);
     const realDates = new Set();
-    for (const e of realEvents) {
-        const d = e.settlement_date || e.event_date;
-        if (!d) continue;
-        realDates.add(`${e.category}|${e.event_type}|${e.direction}|${d}`);
+
+    for (const event of realEvents) {
+        const signature = realEventSignature(event);
+        if (signature) realDates.add(signature);
     }
 
-    for (const r of recurring) {
-        const [ly, lm, ld] = r.lastDate.split('-').map(Number);
+    for (const pattern of recurring || []) {
+        let index = 0;
 
-        if (r.cadenceDays === 30) {
-            // ---- Monthly: step by calendar month, anchor on same DOM ----
-            let y = ly;
-            let m = lm - 1;   // 0-indexed
-            let i = 0;
-            while (i < 24) {
-                m += 1;
-                if (m > 11) { m = 0; y += 1; }
-                const lastDay = new Date(Date.UTC(y, m + 1, 0)).getUTCDate();
-                const dom = Math.min(ld, lastDay);
-                const d = new Date(Date.UTC(y, m, dom));
-                const ms = d.getTime();
-                if (ms > endMs) break;
-                if (ms >= startMs) {
-                    const date = d.toISOString().slice(0, 10);
-                    const sig = `${r.category}|${r.eventType}|${r.direction}|${date}`;
-                    if (!realDates.has(sig)) {
-                        out.push({
-                            event_id: `${r.key}_proj_${i}`,
-                            category: r.category,
-                            event_type: r.eventType,
-                            direction: r.direction,
-                            currency: r.currency,
-                            amount: r.amount,
-                            event_date: date,
-                            settlement_date: date,
-                            status: '__projected__',
-                            flexibility: 'fixed',
-                        });
+        if (pattern.cadenceDays === 30) {
+            // Calendar-month recurrence.
+            let monthOffset = 1;
+
+            while (monthOffset <= 24) {
+                const date = addMonthsClamped(pattern.lastDate, monthOffset);
+
+                if (date > endDate) break;
+
+                if (date >= asOfDate) {
+                    const signature = [
+                        pattern.category || '',
+                        pattern.eventType || '',
+                        pattern.direction || '',
+                        date,
+                    ].join('|');
+
+                    if (!realDates.has(signature)) {
+                        out.push(makeProjection(pattern, date, index));
+                        index++;
                     }
                 }
-                i++;
+
+                monthOffset++;
             }
         } else {
-            // ---- Non-monthly: step by cadenceDays from lastDate ----
-            let nextMs = Date.parse(r.lastDate + 'T00:00:00Z') + r.cadenceDays * DAY_MS;
-            let i = 0;
-            while (nextMs <= endMs && i < 60) {
-                const date = new Date(nextMs).toISOString().slice(0, 10);
-                const sig = `${r.category}|${r.eventType}|${r.direction}|${date}`;
-                if (!realDates.has(sig)) {
-                    out.push({
-                        event_id: `${r.key}_proj_${i}`,
-                        category: r.category,
-                        event_type: r.eventType,
-                        direction: r.direction,
-                        currency: r.currency,
-                        amount: r.amount,
-                        event_date: date,
-                        settlement_date: date,
-                        status: '__projected__',
-                        flexibility: 'fixed',
-                    });
+            // Weekly or biweekly recurrence.
+            let nextDate = addDays(pattern.lastDate, pattern.cadenceDays);
+
+            while (nextDate <= endDate && index < 60) {
+                if (nextDate >= asOfDate) {
+                    const signature = [
+                        pattern.category || '',
+                        pattern.eventType || '',
+                        pattern.direction || '',
+                        nextDate,
+                    ].join('|');
+
+                    if (!realDates.has(signature)) {
+                        out.push(makeProjection(pattern, nextDate, index));
+                        index++;
+                    }
                 }
-                nextMs += r.cadenceDays * DAY_MS;
-                i++;
+
+                nextDate = addDays(nextDate, pattern.cadenceDays);
             }
         }
     }
 
-    // Sort by date so downstream consumers get chronological order.
-    out.sort((a, b) =>
-        a.settlement_date < b.settlement_date ? -1
-            : a.settlement_date > b.settlement_date ? 1
-                : 0
-    );
+    out.sort((a, b) => {
+        if (a.settlement_date !== b.settlement_date) {
+            return a.settlement_date < b.settlement_date ? -1 : 1;
+        }
+        return String(a.event_id).localeCompare(String(b.event_id));
+    });
 
     return out;
 }

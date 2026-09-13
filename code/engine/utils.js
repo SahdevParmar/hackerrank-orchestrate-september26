@@ -2,8 +2,9 @@
 export function overridesFrom(changes) {
     const m = new Map();
     for (const c of changes) {
-        if (c.type === 'stop') m.set(c.eventId, { skip: true });
-        else m.set(c.eventId, { newAmount: c.newAmount });
+        const payload = c.type === 'stop' ? { skip: true } : { newAmount: c.newAmount };
+        m.set(c.eventId, payload);
+        if (c.patternKey) m.set(c.patternKey, payload);
     }
     return m;
 }
